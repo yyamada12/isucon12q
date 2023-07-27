@@ -1,0 +1,6 @@
+.*
+!.gitignore
+/pprof
+bench/
+tmp/
+initial_data/
