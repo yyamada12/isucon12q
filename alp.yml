@@ -8,8 +8,11 @@ limit:           # 5000
 noheaders:       # boolean
 show_footers:    # boolean
 matching_groups: # array
-# - '/icons/.+'
-# - '/history/.+'
+- '/api/organizer/player/.+/disqualified'
+- '/api/organizer/competition/.+/finish'
+- '/api/organizer/competition/.+/score'
+- '/api/player/player/.+'
+- '/api/player/competition/.+/ranking'
 filters:         # string
 output:		count,2xx,3xx,4xx,5xx,method,uri,min,p99,max,sum          # string(comma separated)
 pos_file:        # string
