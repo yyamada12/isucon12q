@@ -374,6 +374,26 @@ type PlayerRow struct {
 }
 
 // 参加者を取得する
+func retrievePlayers(ctx context.Context, tenantDB dbOrTx, ids []string) (map[string]*PlayerRow, error) {
+
+	qs, params, err := sqlx.In(`SELECT * FROM player WHERE id IN (?)`, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	players := []PlayerRow{}
+	if err := tenantDB.SelectContext(ctx, &players, qs, params...); err != nil {
+		return nil, err
+	}
+
+	res := make(map[string]*PlayerRow)
+	for _, p := range players {
+		res[p.ID] = &p
+	}
+	return res, nil
+}
+
+// 参加者を取得する
 func retrievePlayer(ctx context.Context, tenantDB dbOrTx, id string) (*PlayerRow, error) {
 	var p PlayerRow
 	if err := tenantDB.GetContext(ctx, &p, "SELECT * FROM player WHERE id = ?", id); err != nil {
@@ -1390,15 +1410,15 @@ func competitionRankingHandler(c echo.Context) error {
 			continue
 		}
 		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
-		if err != nil {
-			return fmt.Errorf("error retrievePlayer: %w", err)
-		}
+		// p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
+		// if err != nil {
+		// 	return fmt.Errorf("error retrievePlayer: %w", err)
+		// }
 		ranks = append(ranks, CompetitionRank{
-			Score:             ps.Score,
-			PlayerID:          p.ID,
-			PlayerDisplayName: p.DisplayName,
-			RowNum:            ps.RowNum,
+			Score:    ps.Score,
+			PlayerID: ps.PlayerID,
+			// PlayerDisplayName: p.DisplayName,
+			RowNum: ps.RowNum,
 		})
 	}
 	sort.Slice(ranks, func(i, j int) bool {
@@ -1407,7 +1427,9 @@ func competitionRankingHandler(c echo.Context) error {
 		}
 		return ranks[i].Score > ranks[j].Score
 	})
+
 	pagedRanks := make([]CompetitionRank, 0, 100)
+	playerIDs := []string{}
 	for i, rank := range ranks {
 		if int64(i) < rankAfter {
 			continue
@@ -1418,9 +1440,18 @@ func competitionRankingHandler(c echo.Context) error {
 			PlayerID:          rank.PlayerID,
 			PlayerDisplayName: rank.PlayerDisplayName,
 		})
+		playerIDs = append(playerIDs, rank.PlayerID)
 		if len(pagedRanks) >= 100 {
 			break
 		}
+	}
+
+	players, err := retrievePlayers(ctx, tenantDB, playerIDs)
+	if err != nil {
+		return fmt.Errorf("error retrievePlayers: %w", err)
+	}
+	for i, rank := range pagedRanks {
+		pagedRanks[i].PlayerDisplayName = players[rank.PlayerID].DisplayName
 	}
 
 	res := SuccessResult{
