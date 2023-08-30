@@ -1,1 +1,2 @@
 CREATE INDEX idx_visit_history_tenant_id_competition_id_created_at_player_id ON visit_history(tenant_id, competition_id, created_at, player_id);
+CREATE INDEX idx_visit_history_tenant_id_competition_id_player_id_created_at ON visit_history(tenant_id, competition_id, player_id, created_at);
