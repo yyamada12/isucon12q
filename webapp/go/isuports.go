@@ -264,6 +264,70 @@ func (sm *ScoresMap) GetPlayersScore(tenantAndCompetitionID, playerID string) Co
 	return myScores.Get(playerID)
 }
 
+var playersMap PlayersMap
+
+type PlayersMap struct {
+	m  map[string]PlayerRow
+	mu sync.RWMutex
+}
+
+func (pm *PlayersMap) Add(p PlayerRow) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.m == nil {
+		pm.m = make(map[string]PlayerRow)
+	}
+	pm.m[p.ID] = p
+}
+
+func (pm *PlayersMap) Get(id string) PlayerRow {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.m == nil {
+		return PlayerRow{}
+	}
+	return pm.m[id]
+}
+
+func initPlayersMap() {
+	st := time.Now()
+
+	ts := []TenantRow{}
+	if err := adminDB.Select(&ts, "SELECT * FROM tenant ORDER BY id DESC"); err != nil {
+		log.Fatal("failed to select tenant ids for init scores map")
+	}
+
+	var wg sync.WaitGroup
+
+	for _, tenant := range ts {
+		wg.Add(1)
+
+		go func(tenant TenantRow) {
+			defer wg.Done()
+			tenantDB, err := connectToTenantDB(tenant.ID)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			var pls []PlayerRow
+			if err := tenantDB.Select(
+				&pls,
+				"SELECT * FROM player",
+			); err != nil {
+				log.Fatal(err)
+			}
+
+			for _, pl := range pls {
+				playersMap.Add(pl)
+			}
+		}(tenant)
+	}
+
+	wg.Wait()
+
+	fmt.Println("init players map takes:", time.Since(st))
+}
+
 func initScoresMap() {
 	st := time.Now()
 	fmt.Println("init scores map")
@@ -381,6 +445,7 @@ func Run() {
 	defer adminDB.Close()
 
 	initScoresMap()
+	initPlayersMap()
 
 	port := getEnv("SERVER_APP_PORT", "3000")
 	e.Logger.Infof("starting isuports server on : %s ...", port)
@@ -579,24 +644,31 @@ func retrievePlayers(ctx context.Context, tenantDB dbOrTx, ids []string) (map[st
 
 // 参加者を取得する
 func retrievePlayer(ctx context.Context, tenantDB dbOrTx, id string) (*PlayerRow, error) {
-	var p PlayerRow
-	if err := tenantDB.GetContext(ctx, &p, "SELECT * FROM player WHERE id = ?", id); err != nil {
-		return nil, fmt.Errorf("error Select player: id=%s, %w", id, err)
-	}
+	p := playersMap.Get(id)
 	return &p, nil
+
+	// var p PlayerRow
+	// if err := tenantDB.GetContext(ctx, &p, "SELECT * FROM player WHERE id = ?", id); err != nil {
+	// 	return nil, fmt.Errorf("error Select player: id=%s, %w", id, err)
+	// }
+	// return &p, nil
 }
 
 // 参加者を認可する
 // 参加者向けAPIで呼ばれる
 func authorizePlayer(ctx context.Context, tenantDB dbOrTx, id string) error {
-	player, err := retrievePlayer(ctx, tenantDB, id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusUnauthorized, "player not found")
-		}
-		return fmt.Errorf("error retrievePlayer from viewer: %w", err)
+	p := playersMap.Get(id)
+	if p.ID == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "player not found")
 	}
-	if player.IsDisqualified {
+	// player, err := retrievePlayer(ctx, tenantDB, id)
+	// if err != nil {
+	// 	if errors.Is(err, sql.ErrNoRows) {
+	// 		return echo.NewHTTPError(http.StatusUnauthorized, "player not found")
+	// 	}
+	// 	return fmt.Errorf("error retrievePlayer from viewer: %w", err)
+	// }
+	if p.IsDisqualified {
 		return echo.NewHTTPError(http.StatusForbidden, "player is disqualified")
 	}
 	return nil
@@ -1123,11 +1195,24 @@ func playersAddHandler(c echo.Context) error {
 				id, displayName, false, now, now, err,
 			)
 		}
-		p, err := retrievePlayer(ctx, tx, id)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("error retrievePlayer: %w", err)
+
+		p := PlayerRow{
+			ID:             id,
+			TenantID:       v.tenantID,
+			DisplayName:    displayName,
+			IsDisqualified: false,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
+
+		// p, err := retrievePlayer(ctx, tx, id)
+		// if err != nil {
+		// 	tx.Rollback()
+		// 	return fmt.Errorf("error retrievePlayer: %w", err)
+		// }
+
+		playersMap.Add(p)
+
 		pds = append(pds, PlayerDetail{
 			ID:             p.ID,
 			DisplayName:    p.DisplayName,
@@ -1174,6 +1259,13 @@ func playerDisqualifiedHandler(c echo.Context) error {
 	playerID := c.Param("player_id")
 
 	now := time.Now().Unix()
+	p := playersMap.Get(playerID)
+	if p.ID == "" {
+		return echo.NewHTTPError(http.StatusNotFound, "player not found")
+	}
+	p.IsDisqualified = true
+	p.UpdatedAt = now
+
 	if _, err := tx.ExecContext(
 		ctx,
 		"UPDATE player SET is_disqualified = ?, updated_at = ? WHERE id = ?",
@@ -1185,19 +1277,22 @@ func playerDisqualifiedHandler(c echo.Context) error {
 			true, now, playerID, err,
 		)
 	}
-	p, err := retrievePlayer(ctx, tx, playerID)
-	if err != nil {
-		tx.Rollback()
-		// 存在しないプレイヤー
-		if errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusNotFound, "player not found")
-		}
-		return fmt.Errorf("error retrievePlayer: %w", err)
-	}
+
+	// p, err := retrievePlayer(ctx, tx, playerID)
+	// if err != nil {
+	// 	tx.Rollback()
+	// 	// 存在しないプレイヤー
+	// 	if errors.Is(err, sql.ErrNoRows) {
+	// 		return echo.NewHTTPError(http.StatusNotFound, "player not found")
+	// 	}
+	// 	return fmt.Errorf("error retrievePlayer: %w", err)
+	// }
 
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+
+	playersMap.Add(p)
 
 	res := PlayerDisqualifiedHandlerResult{
 		Player: PlayerDetail{
@@ -1412,17 +1507,24 @@ func competitionScoreHandler(c echo.Context) error {
 			return fmt.Errorf("row must have two columns: %#v", row)
 		}
 		playerID, scoreStr := row[0], row[1]
-		if _, err := retrievePlayer(ctx, tx, playerID); err != nil {
-			tx.Rollback()
-			// 存在しない参加者が含まれている
-			if errors.Is(err, sql.ErrNoRows) {
-				return echo.NewHTTPError(
-					http.StatusBadRequest,
-					fmt.Sprintf("player not found: %s", playerID),
-				)
-			}
-			return fmt.Errorf("error retrievePlayer: %w", err)
+		player := playersMap.Get(playerID)
+		if player.ID == "" {
+			return echo.NewHTTPError(
+				http.StatusBadRequest,
+				fmt.Sprintf("player not found: %s", playerID),
+			)
 		}
+		// if _, err := retrievePlayer(ctx, tx, playerID); err != nil {
+		// 	tx.Rollback()
+		// 	// 存在しない参加者が含まれている
+		// 	if errors.Is(err, sql.ErrNoRows) {
+		// 		return echo.NewHTTPError(
+		// 			http.StatusBadRequest,
+		// 			fmt.Sprintf("player not found: %s", playerID),
+		// 		)
+		// 	}
+		// 	return fmt.Errorf("error retrievePlayer: %w", err)
+		// }
 		var score int64
 		if score, err = strconv.ParseInt(scoreStr, 10, 64); err != nil {
 			tx.Rollback()
@@ -1463,10 +1565,10 @@ func competitionScoreHandler(c echo.Context) error {
 	for _, ps := range playerScoreRows {
 		playerIDs = append(playerIDs, ps.PlayerID)
 	}
-	players, err := retrievePlayers(ctx, tenantDB, playerIDs)
-	if err != nil {
-		return fmt.Errorf("error retrievePlayers: %w", err)
-	}
+	// players, err := retrievePlayers(ctx, tenantDB, playerIDs)
+	// if err != nil {
+	// 	return fmt.Errorf("error retrievePlayers: %w", err)
+	// }
 
 	myScores := MyScores{}
 	myScores.m = make(map[string]CompetitionRank)
@@ -1487,7 +1589,7 @@ func competitionScoreHandler(c echo.Context) error {
 		myScores.m[ps.PlayerID] = CompetitionRank{
 			Score:             ps.Score,
 			PlayerID:          ps.PlayerID,
-			PlayerDisplayName: players[ps.PlayerID].DisplayName,
+			PlayerDisplayName: playersMap.Get(ps.PlayerID).DisplayName,
 			RowNum:            ps.RowNum,
 		}
 	}
@@ -1594,13 +1696,18 @@ func playerHandler(c echo.Context) error {
 	if playerID == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "player_id is required")
 	}
-	p, err := retrievePlayer(ctx, tenantDB, playerID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusNotFound, "player not found")
-		}
-		return fmt.Errorf("error retrievePlayer: %w", err)
+	// p, err := retrievePlayer(ctx, tenantDB, playerID)
+	// if err != nil {
+	// 	if errors.Is(err, sql.ErrNoRows) {
+	// 		return echo.NewHTTPError(http.StatusNotFound, "player not found")
+	// 	}
+	// 	return fmt.Errorf("error retrievePlayer: %w", err)
+	// }
+	p := playersMap.Get(playerID)
+	if p.ID == "" {
+		return echo.NewHTTPError(http.StatusNotFound, "player not found")
 	}
+
 	cs := []CompetitionRow{}
 	if err := tenantDB.SelectContext(
 		ctx,
@@ -1821,12 +1928,12 @@ func competitionRankingHandler(c echo.Context) error {
 	}
 
 	if len(playerIDs) > 0 {
-		players, err := retrievePlayers(ctx, tenantDB, playerIDs)
-		if err != nil {
-			return fmt.Errorf("error retrievePlayers: %w", err)
-		}
+		// players, err := retrievePlayers(ctx, tenantDB, playerIDs)
+		// if err != nil {
+		// 	return fmt.Errorf("error retrievePlayers: %w", err)
+		// }
 		for i, rank := range pagedRanks {
-			pagedRanks[i].PlayerDisplayName = players[rank.PlayerID].DisplayName
+			pagedRanks[i].PlayerDisplayName = playersMap.Get(rank.PlayerID).DisplayName
 		}
 	}
 
@@ -1991,25 +2098,37 @@ func meHandler(c echo.Context) error {
 		})
 	}
 
-	tenantDB, err := connectToTenantDB(v.tenantID)
-	if err != nil {
-		return fmt.Errorf("error connectToTenantDB: %w", err)
-	}
-	ctx := context.Background()
-	p, err := retrievePlayer(ctx, tenantDB, v.playerID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.JSON(http.StatusOK, SuccessResult{
-				Status: true,
-				Data: MeHandlerResult{
-					Tenant:   td,
-					Me:       nil,
-					Role:     RoleNone,
-					LoggedIn: false,
-				},
-			})
-		}
-		return fmt.Errorf("error retrievePlayer: %w", err)
+	// tenantDB, err := connectToTenantDB(v.tenantID)
+	// if err != nil {
+	// 	return fmt.Errorf("error connectToTenantDB: %w", err)
+	// }
+	// ctx := context.Background()
+	// p, err := retrievePlayer(ctx, tenantDB, v.playerID)
+	// if err != nil {
+	// 	if errors.Is(err, sql.ErrNoRows) {
+	// 		return c.JSON(http.StatusOK, SuccessResult{
+	// 			Status: true,
+	// 			Data: MeHandlerResult{
+	// 				Tenant:   td,
+	// 				Me:       nil,
+	// 				Role:     RoleNone,
+	// 				LoggedIn: false,
+	// 			},
+	// 		})
+	// 	}
+	// 	return fmt.Errorf("error retrievePlayer: %w", err)
+	// }
+	p := playersMap.Get(v.playerID)
+	if p.ID == "" {
+		return c.JSON(http.StatusOK, SuccessResult{
+			Status: true,
+			Data: MeHandlerResult{
+				Tenant:   td,
+				Me:       nil,
+				Role:     RoleNone,
+				LoggedIn: false,
+			},
+		})
 	}
 
 	return c.JSON(http.StatusOK, SuccessResult{
@@ -2042,6 +2161,7 @@ func initializeHandler(c echo.Context) error {
 	}
 
 	initScoresMap()
+	initPlayersMap()
 
 	res := InitializeHandlerResult{
 		Lang: "go",
