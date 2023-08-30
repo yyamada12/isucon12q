@@ -178,6 +178,126 @@ func SetCacheControlPrivate(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+var scoresMap ScoresMap
+
+type ScoresMap struct {
+	m  map[string]*MyScores
+	mu sync.RWMutex
+}
+
+type MyScores struct {
+	m  map[string]CompetitionRank
+	mu sync.RWMutex
+}
+
+func (sm *ScoresMap) Add(tenantAndCompetitionID string, score *MyScores) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.m == nil {
+		sm.m = make(map[string]*MyScores)
+	}
+	sm.m[tenantAndCompetitionID] = score
+}
+
+func (sm *ScoresMap) Get(tenantAndCompetitionID string) *MyScores {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.m[tenantAndCompetitionID]
+}
+
+func (scores *MyScores) Add(userID string, rank CompetitionRank) {
+	scores.mu.Lock()
+	defer scores.mu.Unlock()
+	if scores.m == nil {
+		scores.m = make(map[string]CompetitionRank)
+	}
+	scores.m[userID] = rank
+}
+
+func (sm *ScoresMap) AddScore(tenantAndCompetitionID string, userID string, rank CompetitionRank) {
+	myScores := sm.Get(tenantAndCompetitionID)
+	if myScores == nil {
+		myScores = &MyScores{}
+	}
+	myScores.Add(userID, rank)
+}
+
+func (sm *ScoresMap) GetRanks(tenantAndCompetitionID string) []CompetitionRank {
+	myScores := sm.Get(tenantAndCompetitionID)
+	if myScores == nil {
+		return []CompetitionRank{}
+	}
+	myScores.mu.Lock()
+	defer myScores.mu.Unlock()
+	res := []CompetitionRank{}
+	for _, rank := range myScores.m {
+		res = append(res, rank)
+	}
+	return res
+}
+
+func (sm *ScoresMap) GetSoretedRanks(tenantAndCompetitionID string) []CompetitionRank {
+	ranks := sm.GetRanks(tenantAndCompetitionID)
+	sort.Slice(ranks, func(i, j int) bool {
+		if ranks[i].Score == ranks[j].Score {
+			return ranks[i].RowNum < ranks[j].RowNum
+		}
+		return ranks[i].Score > ranks[j].Score
+	})
+	return ranks
+}
+
+func initScoresMap() {
+	st := time.Now()
+	fmt.Println("init scores map")
+
+	ts := []TenantRow{}
+	if err := adminDB.Select(&ts, "SELECT * FROM tenant ORDER BY id DESC"); err != nil {
+		log.Fatal("failed to select tenant ids for init scores map")
+	}
+
+	var wg sync.WaitGroup
+
+	for _, tenant := range ts {
+		wg.Add(1)
+
+		go func(tenant TenantRow) {
+			defer wg.Done()
+			tenantDB, err := connectToTenantDB(tenant.ID)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			pss := []PlayerScoreRow{}
+			if err := tenantDB.Select(
+				&pss,
+				"SELECT ps.*, p.display_name as player_display_name FROM player_score ps JOIN player p ON ps.player_id = p.id WHERE ps.tenant_id = ?",
+				tenant.ID,
+			); err != nil {
+				tenantDB.Close()
+				log.Fatal(err)
+			}
+			tenantDB.Close()
+
+			tenantID := strconv.Itoa(int(tenant.ID))
+			for _, score := range pss {
+				rank := CompetitionRank{
+					Score:             score.Score,
+					PlayerID:          score.PlayerID,
+					PlayerDisplayName: score.PlayerDisplayName,
+					RowNum:            score.RowNum,
+				}
+				scoresMap.AddScore(tenantID+score.CompetitionID, score.PlayerID, rank)
+			}
+		}(tenant)
+
+	}
+
+	wg.Wait()
+
+	fmt.Println("init scores map takes:", time.Since(st))
+}
+
 // Run は cmd/isuports/main.go から呼ばれるエントリーポイントです
 func Run() {
 	go func() {
@@ -242,6 +362,8 @@ func Run() {
 	}
 	adminDB.SetMaxOpenConns(10)
 	defer adminDB.Close()
+
+	initScoresMap()
 
 	port := getEnv("SERVER_APP_PORT", "3000")
 	e.Logger.Infof("starting isuports server on : %s ...", port)
@@ -482,14 +604,15 @@ func retrieveCompetition(ctx context.Context, tenantDB dbOrTx, id string) (*Comp
 }
 
 type PlayerScoreRow struct {
-	TenantID      int64  `db:"tenant_id"`
-	ID            string `db:"id"`
-	PlayerID      string `db:"player_id"`
-	CompetitionID string `db:"competition_id"`
-	Score         int64  `db:"score"`
-	RowNum        int64  `db:"row_num"`
-	CreatedAt     int64  `db:"created_at"`
-	UpdatedAt     int64  `db:"updated_at"`
+	TenantID          int64  `db:"tenant_id"`
+	ID                string `db:"id"`
+	PlayerID          string `db:"player_id"`
+	PlayerDisplayName string `db:"player_display_name"`
+	CompetitionID     string `db:"competition_id"`
+	Score             int64  `db:"score"`
+	RowNum            int64  `db:"row_num"`
+	CreatedAt         int64  `db:"created_at"`
+	UpdatedAt         int64  `db:"updated_at"`
 }
 
 // 排他ロックのためのファイル名を生成する
@@ -1318,6 +1441,19 @@ func competitionScoreHandler(c echo.Context) error {
 		tx.Rollback()
 		return fmt.Errorf("error Delete player_score: tenantID=%d, competitionID=%s, %w", v.tenantID, competitionID, err)
 	}
+
+	playerIDs := []string{}
+	for _, ps := range playerScoreRows {
+		playerIDs = append(playerIDs, ps.PlayerID)
+	}
+	players, err := retrievePlayers(ctx, tenantDB, playerIDs)
+	if err != nil {
+		return fmt.Errorf("error retrievePlayers: %w", err)
+	}
+
+	myScores := MyScores{}
+	myScores.m = make(map[string]CompetitionRank)
+
 	for _, ps := range playerScoreRows {
 		if _, err := tx.NamedExecContext(
 			ctx,
@@ -1331,7 +1467,16 @@ func competitionScoreHandler(c echo.Context) error {
 			)
 
 		}
+		myScores.m[ps.PlayerID] = CompetitionRank{
+			Score:             ps.Score,
+			PlayerID:          ps.PlayerID,
+			PlayerDisplayName: players[ps.PlayerID].DisplayName,
+			RowNum:            ps.RowNum,
+		}
 	}
+
+	tenantID := strconv.Itoa(int(v.tenantID))
+	scoresMap.Add(tenantID+competitionID, &myScores)
 
 	// すべての処理が成功した場合はコミット
 	if err = tx.Commit(); err != nil {
@@ -1522,7 +1667,7 @@ func competitionRankingHandler(c echo.Context) error {
 	ctx := context.Background()
 	v, err := parseViewer(c)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parseViewer: %w", err)
 	}
 	if v.role != RolePlayer {
 		return echo.NewHTTPError(http.StatusForbidden, "role player required")
@@ -1530,12 +1675,12 @@ func competitionRankingHandler(c echo.Context) error {
 
 	tenantDB, err := connectToTenantDB(v.tenantID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connectToTenantDB: %w", err)
 	}
 	defer tenantDB.Close()
 
 	if err := authorizePlayer(ctx, tenantDB, v.playerID); err != nil {
-		return err
+		return fmt.Errorf("failed to authorizePlayer: %w", err)
 	}
 
 	competitionID := c.Param("competition_id")
@@ -1583,42 +1728,45 @@ func competitionRankingHandler(c echo.Context) error {
 	// 	return fmt.Errorf("error flockByTenantID: %w", err)
 	// }
 	// defer fl.Close()
-	pss := []PlayerScoreRow{}
-	if err := tenantDB.SelectContext(
-		ctx,
-		&pss,
-		"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
-		tenant.ID,
-		competitionID,
-	); err != nil {
-		return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
-	}
-	ranks := make([]CompetitionRank, 0, len(pss))
-	scoredPlayerSet := make(map[string]struct{}, len(pss))
-	for _, ps := range pss {
-		// player_scoreが同一player_id内ではrow_numの降順でソートされているので
-		// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
-		if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
-			continue
-		}
-		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		// p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
-		// if err != nil {
-		// 	return fmt.Errorf("error retrievePlayer: %w", err)
-		// }
-		ranks = append(ranks, CompetitionRank{
-			Score:    ps.Score,
-			PlayerID: ps.PlayerID,
-			// PlayerDisplayName: p.DisplayName,
-			RowNum: ps.RowNum,
-		})
-	}
-	sort.Slice(ranks, func(i, j int) bool {
-		if ranks[i].Score == ranks[j].Score {
-			return ranks[i].RowNum < ranks[j].RowNum
-		}
-		return ranks[i].Score > ranks[j].Score
-	})
+	// pss := []PlayerScoreRow{}
+	// if err := tenantDB.SelectContext(
+	// 	ctx,
+	// 	&pss,
+	// 	"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
+	// 	tenant.ID,
+	// 	competitionID,
+	// ); err != nil {
+	// 	return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
+	// }
+	// ranks := make([]CompetitionRank, 0, len(pss))
+	// scoredPlayerSet := make(map[string]struct{}, len(pss))
+	// for _, ps := range pss {
+	// 	// player_scoreが同一player_id内ではrow_numの降順でソートされているので
+	// 	// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+	// 	if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
+	// 		continue
+	// 	}
+	// 	scoredPlayerSet[ps.PlayerID] = struct{}{}
+	// 	// p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
+	// 	// if err != nil {
+	// 	// 	return fmt.Errorf("error retrievePlayer: %w", err)
+	// 	// }
+	// 	ranks = append(ranks, CompetitionRank{
+	// 		Score:    ps.Score,
+	// 		PlayerID: ps.PlayerID,
+	// 		// PlayerDisplayName: p.DisplayName,
+	// 		RowNum: ps.RowNum,
+	// 	})
+	// }
+	// sort.Slice(ranks, func(i, j int) bool {
+	// 	if ranks[i].Score == ranks[j].Score {
+	// 		return ranks[i].RowNum < ranks[j].RowNum
+	// 	}
+	// 	return ranks[i].Score > ranks[j].Score
+	// })
+
+	tenantID := strconv.Itoa(int(v.tenantID))
+	ranks := scoresMap.GetSoretedRanks(tenantID + competitionID)
 
 	pagedRanks := make([]CompetitionRank, 0, 100)
 	playerIDs := []string{}
@@ -1647,6 +1795,20 @@ func competitionRankingHandler(c echo.Context) error {
 			pagedRanks[i].PlayerDisplayName = players[rank.PlayerID].DisplayName
 		}
 	}
+
+	// tenantID := strconv.Itoa(int(v.tenantID))
+	// myRanks := scoresMap.GetSoretedRanks(tenantID + competitionID)
+
+	// if len(myRanks) < len(pagedRanks) {
+	// 	fmt.Println("NOOOOOOOOOOOOOO!!!!!!!!!!!!!!! myRanks len おかしい: ", len(myRanks))
+	// } else {
+	// 	for i, rank := range pagedRanks {
+
+	// 		if rank.Score != myRanks[i].Score {
+	// 			fmt.Println("NOOOOOOOOOO!!!!!!!!!!!!!!!!!! rank.Score:", rank.Score, ",:", myRanks[i].Score)
+	// 		}
+	// 	}
+	// }
 
 	res := SuccessResult{
 		Status: true,
@@ -1844,6 +2006,9 @@ func initializeHandler(c echo.Context) error {
 	if err != nil {
 		return fmt.Errorf("error exec.Command: %s %e", string(out), err)
 	}
+
+	initScoresMap()
+
 	res := InitializeHandlerResult{
 		Lang: "go",
 	}
