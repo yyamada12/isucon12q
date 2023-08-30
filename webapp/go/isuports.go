@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -78,13 +79,41 @@ func tenantDBPath(id int64) string {
 	return filepath.Join(tenantDBDir, fmt.Sprintf("%d.db", id))
 }
 
+var tenantDBPool TenantDBPool
+
+type TenantDBPool struct {
+	m  map[int64]*sqlx.DB
+	mu sync.RWMutex
+}
+
+func (pool *TenantDBPool) Get(id int64) *sqlx.DB {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	return pool.m[id]
+}
+
+func (pool *TenantDBPool) Add(id int64, db *sqlx.DB) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.m == nil {
+		pool.m = make(map[int64]*sqlx.DB)
+	}
+	pool.m[id] = db
+}
+
 // テナントDBに接続する
 func connectToTenantDB(id int64) (*sqlx.DB, error) {
+	// db := tenantDBPool.Get(id)
+	// if db != nil {
+	// 	return db, nil
+	// }
+
 	p := tenantDBPath(id)
 	db, err := sqlx.Open(sqliteDriverName, fmt.Sprintf("file:%s?mode=rw", p))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open tenant DB: %w", err)
 	}
+	// tenantDBPool.Add(id, db)
 	return db, nil
 }
 
