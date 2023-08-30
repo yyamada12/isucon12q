@@ -588,8 +588,14 @@ type VisitHistoryRow struct {
 }
 
 type VisitHistorySummaryRow struct {
-	PlayerID     string `db:"player_id"`
-	MinCreatedAt int64  `db:"min_created_at"`
+	CompetitionID string `db:"competition_id"`
+	PlayerID      string `db:"player_id"`
+	MinCreatedAt  int64  `db:"min_created_at"`
+}
+
+type ScoredPlayerSummaryRow struct {
+	CompetitionID string `db:"competition_id"`
+	PlayerID      string `db:"player_id"`
 }
 
 // 大会ごとの課金レポートを計算する
@@ -663,6 +669,34 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 		BillingVisitorYen: 10 * visitorCount, // ランキングを閲覧だけした(スコアを登録していない)参加者は10円
 		BillingYen:        100*playerCount + 10*visitorCount,
 	}, nil
+}
+
+// 大会ごとの課金レポートを計算する
+func calcBilling(comp *CompetitionRow, visitedPlayerIDs, scoredPlayerIDs []string) (int64, error) {
+
+	billingMap := map[string]string{}
+	for _, pid := range visitedPlayerIDs {
+		billingMap[pid] = "visitor"
+	}
+
+	for _, pid := range scoredPlayerIDs {
+		// スコアが登録されている参加者
+		billingMap[pid] = "player"
+	}
+
+	// 大会が終了している場合のみ請求金額が確定するので計算する
+	var playerCount, visitorCount int64
+	if comp.FinishedAt.Valid {
+		for _, category := range billingMap {
+			switch category {
+			case "player":
+				playerCount++
+			case "visitor":
+				visitorCount++
+			}
+		}
+	}
+	return 100*playerCount + 10*visitorCount, nil
 }
 
 type TenantWithBilling struct {
@@ -742,13 +776,74 @@ func tenantsBillingHandler(c echo.Context) error {
 			); err != nil {
 				return fmt.Errorf("failed to Select competition: %w", err)
 			}
-			for _, comp := range cs {
-				report, err := billingReportByCompetition(ctx, tenantDB, t.ID, comp.ID)
-				if err != nil {
-					return fmt.Errorf("failed to billingReportByCompetition: %w", err)
-				}
-				tb.BillingYen += report.BillingYen
+
+			compMap := map[string]CompetitionRow{}
+			for _, c := range cs {
+				compMap[c.ID] = c
 			}
+
+			// visitor
+			visitedMap := map[string][]string{}
+
+			// ランキングにアクセスした参加者のIDを取得する
+			vhs := []VisitHistorySummaryRow{}
+			if err := adminDB.SelectContext(
+				ctx,
+				&vhs,
+				"SELECT competition_id, player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = ? GROUP BY competition_id, player_id",
+				t.ID,
+			); err != nil && err != sql.ErrNoRows {
+				return fmt.Errorf("error Select visit_history: tenantID=%d, %w", t.ID, err)
+			}
+
+			for _, vh := range vhs {
+				// competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
+				comp := compMap[vh.CompetitionID]
+				if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < vh.MinCreatedAt {
+					continue
+				}
+				visitedMap[comp.ID] = append(visitedMap[comp.ID], vh.PlayerID)
+			}
+
+			// player
+			scoredPlayerIDs := []ScoredPlayerSummaryRow{}
+			if err := tenantDB.SelectContext(
+				ctx,
+				&scoredPlayerIDs,
+				"SELECT competition_id, player_id FROM player_score WHERE tenant_id = ? GROUP BY competition_id, player_id",
+				t.ID,
+			); err != nil && err != sql.ErrNoRows {
+				return fmt.Errorf("error Select count player_score: tenantID=%d, %w", t.ID, err)
+			}
+
+			scoredMap := map[string][]string{}
+			for _, player := range scoredPlayerIDs {
+				scoredMap[player.CompetitionID] = append(scoredMap[player.CompetitionID], player.PlayerID)
+			}
+
+			// calc
+			for _, comp := range cs {
+				if !comp.FinishedAt.Valid {
+					continue
+				}
+
+				visitedPlayerIDs := visitedMap[comp.ID]
+				scoredPlayerIDs := scoredMap[comp.ID]
+
+				billingYen, err := calcBilling(&comp, visitedPlayerIDs, scoredPlayerIDs)
+				if err != nil {
+					return fmt.Errorf("failed to calcBilling: %w", err)
+				}
+				tb.BillingYen += billingYen
+			}
+
+			// for _, comp := range cs {
+			// 	report, err := billingReportByCompetition(ctx, tenantDB, t.ID, comp.ID)
+			// 	if err != nil {
+			// 		return fmt.Errorf("failed to billingReportByCompetition: %w", err)
+			// 	}
+			// 	tb.BillingYen += report.BillingYen
+			// }
 			tenantBillings = append(tenantBillings, tb)
 			return nil
 		}(t)
