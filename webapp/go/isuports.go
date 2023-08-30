@@ -162,6 +162,111 @@ func SetCacheControlPrivate(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+var scoresMap ScoresMap
+
+type ScoresMap struct {
+	m  map[string]*MyScores
+	mu sync.RWMutex
+}
+
+type MyScores struct {
+	m  map[string]CompetitionRank
+	mu sync.RWMutex
+}
+
+func (sm *ScoresMap) Add(tenantAndCompetitionID string, score *MyScores) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.m == nil {
+		sm.m = make(map[string]*MyScores)
+	}
+	sm.m[tenantAndCompetitionID] = score
+}
+
+func (sm *ScoresMap) Get(tenantAndCompetitionID string) *MyScores {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.m[tenantAndCompetitionID]
+}
+
+func (scores *MyScores) Add(userID string, rank CompetitionRank) {
+	scores.mu.Lock()
+	defer scores.mu.Unlock()
+	if scores.m == nil {
+		scores.m = make(map[string]CompetitionRank)
+	}
+	scores.m[userID] = rank
+}
+
+func (sm *ScoresMap) AddScore(tenantAndCompetitionID string, userID string, rank CompetitionRank) {
+	myScores := sm.Get(tenantAndCompetitionID)
+	if myScores == nil {
+		myScores = &MyScores{}
+	}
+	myScores.Add(userID, rank)
+}
+
+func (sm *ScoresMap) GetRanks(tenantAndCompetitionID string) []CompetitionRank {
+	myScores := sm.Get(tenantAndCompetitionID)
+	myScores.mu.Lock()
+	defer myScores.mu.Unlock()
+	res := []CompetitionRank{}
+	for _, rank := range myScores.m {
+		res = append(res, rank)
+	}
+	return res
+}
+
+func (sm *ScoresMap) GetSoretedRanks(tenantAndCompetitionID string) []CompetitionRank {
+	ranks := sm.GetRanks(tenantAndCompetitionID)
+	sort.Slice(ranks, func(i, j int) bool {
+		if ranks[i].Score == ranks[j].Score {
+			return ranks[i].RowNum < ranks[j].RowNum
+		}
+		return ranks[i].Score > ranks[j].Score
+	})
+	return ranks
+}
+
+func initScoresMap() {
+	fmt.Println("hogee")
+
+	ts := []TenantRow{}
+	if err := adminDB.Select(&ts, "SELECT * FROM tenant ORDER BY id DESC"); err != nil {
+		log.Fatal("failed to select tenant ids for init scores map")
+	}
+
+	for _, tenant := range ts {
+		tenantDB, err := connectToTenantDB(tenant.ID)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		pss := []PlayerScoreRow{}
+		if err := tenantDB.Select(
+			&pss,
+			"SELECT ps.*, p.display_name as player_display_name FROM player_score ps JOIN player p ON ps.player_id = p.id WHERE ps.tenant_id = ?",
+			tenant.ID,
+		); err != nil {
+			tenantDB.Close()
+			log.Fatal(err)
+		}
+		tenantDB.Close()
+
+		tenantID := strconv.Itoa(int(tenant.ID))
+		for _, score := range pss {
+			rank := CompetitionRank{
+				Score:             score.Score,
+				PlayerID:          score.PlayerID,
+				PlayerDisplayName: score.PlayerDisplayName,
+				RowNum:            score.RowNum,
+			}
+			scoresMap.AddScore(tenantID+score.CompetitionID, score.PlayerID, rank)
+		}
+
+	}
+}
+
 // Run は cmd/isuports/main.go から呼ばれるエントリーポイントです
 func Run() {
 	go func() {
@@ -226,6 +331,8 @@ func Run() {
 	}
 	adminDB.SetMaxOpenConns(10)
 	defer adminDB.Close()
+
+	initScoresMap()
 
 	port := getEnv("SERVER_APP_PORT", "3000")
 	e.Logger.Infof("starting isuports server on : %s ...", port)
@@ -466,14 +573,15 @@ func retrieveCompetition(ctx context.Context, tenantDB dbOrTx, id string) (*Comp
 }
 
 type PlayerScoreRow struct {
-	TenantID      int64  `db:"tenant_id"`
-	ID            string `db:"id"`
-	PlayerID      string `db:"player_id"`
-	CompetitionID string `db:"competition_id"`
-	Score         int64  `db:"score"`
-	RowNum        int64  `db:"row_num"`
-	CreatedAt     int64  `db:"created_at"`
-	UpdatedAt     int64  `db:"updated_at"`
+	TenantID          int64  `db:"tenant_id"`
+	ID                string `db:"id"`
+	PlayerID          string `db:"player_id"`
+	PlayerDisplayName string `db:"player_display_name"`
+	CompetitionID     string `db:"competition_id"`
+	Score             int64  `db:"score"`
+	RowNum            int64  `db:"row_num"`
+	CreatedAt         int64  `db:"created_at"`
+	UpdatedAt         int64  `db:"updated_at"`
 }
 
 // 排他ロックのためのファイル名を生成する
@@ -1161,6 +1269,17 @@ func competitionScoreHandler(c echo.Context) error {
 	); err != nil {
 		return fmt.Errorf("error Delete player_score: tenantID=%d, competitionID=%s, %w", v.tenantID, competitionID, err)
 	}
+
+	playerIDs := []string{}
+	for _, ps := range playerScoreRows {
+		playerIDs = append(playerIDs, ps.PlayerID)
+	}
+	players, err := retrievePlayers(ctx, tenantDB, playerIDs)
+	if err != nil {
+		return fmt.Errorf("error retrievePlayers: %w", err)
+	}
+
+	tenantID := strconv.Itoa(int(v.tenantID))
 	for _, ps := range playerScoreRows {
 		if _, err := tenantDB.NamedExecContext(
 			ctx,
@@ -1173,6 +1292,13 @@ func competitionScoreHandler(c echo.Context) error {
 			)
 
 		}
+		rank := CompetitionRank{
+			Score:             ps.Score,
+			PlayerID:          ps.PlayerID,
+			PlayerDisplayName: players[ps.PlayerID].DisplayName,
+			RowNum:            ps.RowNum,
+		}
+		scoresMap.AddScore(tenantID+ps.CompetitionID, ps.PlayerID, rank)
 	}
 
 	return c.JSON(http.StatusOK, SuccessResult{
@@ -1483,6 +1609,30 @@ func competitionRankingHandler(c echo.Context) error {
 		pagedRanks[i].PlayerDisplayName = players[rank.PlayerID].DisplayName
 	}
 
+	myRanks := scoresMap.GetSoretedRanks(strconv.Itoa(int(v.tenantID)) + competitionID)
+	myPagedRanks := make([]CompetitionRank, 0, 100)
+	for i, rank := range myRanks {
+		if int64(i) < rankAfter {
+			continue
+		}
+		myPagedRanks = append(myPagedRanks, CompetitionRank{
+			Rank:              int64(i + 1),
+			Score:             rank.Score,
+			PlayerID:          rank.PlayerID,
+			PlayerDisplayName: rank.PlayerDisplayName,
+		})
+		if len(myPagedRanks) >= 100 {
+			break
+		}
+	}
+
+	for i, rank := range pagedRanks {
+		myRank := myPagedRanks[i]
+		if rank.Score != myRank.Score {
+			fmt.Printf("NOOOOOOOOOOOOOOOOOO, rank score: %d, myRank score: %d", rank.Score, myRank.Score)
+		}
+	}
+
 	res := SuccessResult{
 		Status: true,
 		Data: CompetitionRankingHandlerResult{
@@ -1679,6 +1829,9 @@ func initializeHandler(c echo.Context) error {
 	if err != nil {
 		return fmt.Errorf("error exec.Command: %s %e", string(out), err)
 	}
+
+	initScoresMap()
+
 	res := InitializeHandlerResult{
 		Lang: "go",
 	}
